@@ -1,8 +1,9 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, path::PathBuf};
 
 use anyhow::Result;
 use bore_cli::{client::Client, server::Server};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -25,7 +26,7 @@ enum Command {
 
         /// Address of the remote server to expose local ports to.
         #[clap(short, long, env = "BORE_SERVER")]
-        to: String,
+        to: Option<String>,
 
         /// Optional port on the remote server to select.
         #[clap(short, long, default_value_t = 0)]
@@ -60,6 +61,12 @@ enum Command {
     },
 }
 
+#[derive(Default, Deserialize)]
+struct Config {
+    server: Option<String>,
+    secret: Option<String>,
+}
+
 #[tokio::main]
 async fn run(command: Command) -> Result<()> {
     match command {
@@ -70,6 +77,27 @@ async fn run(command: Command) -> Result<()> {
             port,
             secret,
         } => {
+            let config_path = std::env::var("XDG_CONFIG_HOME").map_or_else(
+                |_| std::env::home_dir().unwrap().join(".config"),
+                PathBuf::from,
+            ).join("bore.toml");
+
+            let config: Config = if config_path.exists() {
+                toml::from_str(
+                    &std::fs::read_to_string(config_path).expect("failed to read config file"),
+                )
+                .expect("failed to parse config file")
+            } else {
+                Default::default()
+            };
+
+            let (to, secret) = to.map_or((config.server, config.secret), |t| (Some(t), secret));
+            let Some(to) = to else {
+                Args::command()
+                    .error(ErrorKind::MissingRequiredArgument, "no server was specified, and none was found in the config")
+                    .exit();
+            };
+
             let client = Client::new(&local_host, local_port, &to, port, secret.as_deref()).await?;
             client.listen().await?;
         }
