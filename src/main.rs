@@ -1,7 +1,7 @@
 use std::{net::IpAddr, path::PathBuf};
 
 use anyhow::Result;
-use bore_cli::{client::Client, server::Server};
+use bore_cli::{client::Client, server::Server, shared::ForwardingEndpoint};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use serde::Deserialize;
 
@@ -15,6 +15,7 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Starts a local proxy to the remote server.
+    #[clap(disable_help_flag(true))]
     Local {
         /// The local port to expose.
         #[clap(env = "BORE_LOCAL_PORT")]
@@ -31,6 +32,10 @@ enum Command {
         /// Optional port on the remote server to select.
         #[clap(short, long, default_value_t = 0)]
         port: u16,
+
+        /// Expose the port via HTTP[S] on the remote server.
+        #[clap(short, long)]
+        http: bool,
 
         /// Optional secret for authentication.
         #[clap(short, long, env = "BORE_SECRET", hide_env_values = true)]
@@ -58,6 +63,10 @@ enum Command {
         /// IP address where tunnels will listen on, defaults to --bind-addr.
         #[clap(long)]
         bind_tunnels: Option<IpAddr>,
+
+        /// UNIX socket to create for HTTP connections.
+        #[clap(long)]
+        http_socket: Option<PathBuf>,
     },
 }
 
@@ -75,6 +84,7 @@ async fn run(command: Command) -> Result<()> {
             local_port,
             to,
             port,
+            http,
             secret,
         } => {
             let config_path = std::env::var("XDG_CONFIG_HOME").map_or_else(
@@ -94,11 +104,30 @@ async fn run(command: Command) -> Result<()> {
             let (to, secret) = to.map_or((config.server, config.secret), |t| (Some(t), secret));
             let Some(to) = to else {
                 Args::command()
-                    .error(ErrorKind::MissingRequiredArgument, "no server was specified, and none was found in the config")
+                    .error(
+                        ErrorKind::MissingRequiredArgument,
+                        "no server was specified, and none was found in the config",
+                    )
                     .exit();
             };
 
-            let client = Client::new(&local_host, local_port, &to, port, secret.as_deref()).await?;
+            let endpoint = if http {
+                if port != 0 {
+                    Args::command()
+                        .error(
+                            ErrorKind::ArgumentConflict,
+                            "both --port and --http were specified at the same time",
+                        )
+                        .exit();
+                }
+
+                ForwardingEndpoint::Http
+            } else {
+                ForwardingEndpoint::Tcp(port)
+            };
+
+            let client =
+                Client::new(&local_host, local_port, &to, endpoint, secret.as_deref()).await?;
             client.listen().await?;
         }
         Command::Server {
@@ -107,6 +136,7 @@ async fn run(command: Command) -> Result<()> {
             secret,
             bind_addr,
             bind_tunnels,
+            http_socket,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -117,6 +147,7 @@ async fn run(command: Command) -> Result<()> {
             let mut server = Server::new(port_range, secret.as_deref());
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
+            server.set_http_socket(http_socket);
             server.listen().await?;
         }
     }

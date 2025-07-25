@@ -20,14 +20,23 @@ pub const MAX_FRAME_LENGTH: usize = 256;
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Publicly exposed endpoint connections are forwarded from.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ForwardingEndpoint {
+    /// A TCP port.
+    Tcp(u16),
+    /// An HTTP/HTTPS endpoint.
+    Http,
+}
+
 /// A message from the client on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// Response to an authentication challenge from the server.
     Authenticate(String),
 
-    /// Initial client message specifying a port to forward.
-    Hello(u16),
+    /// Initial client message specifying a public endpoint to forward to.
+    Hello(ForwardingEndpoint),
 
     /// Accepts an incoming TCP connection, using this stream as a proxy.
     Accept(Uuid),
@@ -39,8 +48,8 @@ pub enum ServerMessage {
     /// Authentication challenge, sent as the first message, if enabled.
     Challenge(Uuid),
 
-    /// Response to a client's initial message, with actual public port.
-    Hello(u16),
+    /// Response to a client's initial message, with the actual public forwarding endpoint.
+    Hello(ForwardingEndpoint),
 
     /// No-op used to test if the client is still reachable.
     Heartbeat,

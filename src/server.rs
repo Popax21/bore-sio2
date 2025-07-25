@@ -1,18 +1,21 @@
 //! Server implementation for the `bore` service.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::fmt::Debug;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::{io, ops::RangeInclusive, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use dashmap::DashMap;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::time::{sleep, timeout};
 use tracing::{info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT};
+use crate::shared::{ClientMessage, Delimited, ForwardingEndpoint, ServerMessage, CONTROL_PORT};
 
 /// State structure for the server.
 pub struct Server {
@@ -23,13 +26,16 @@ pub struct Server {
     auth: Option<Authenticator>,
 
     /// Concurrent map of IDs to incoming connections.
-    conns: Arc<DashMap<Uuid, TcpStream>>,
+    conns: Arc<DashMap<Uuid, Pin<Box<dyn Connection>>>>,
 
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
     /// IP address where tunnels will listen on.
     bind_tunnels: IpAddr,
+
+    /// UNIX socket which is created for HTTP connections.
+    http_socket: Option<PathBuf>,
 }
 
 impl Server {
@@ -42,6 +48,7 @@ impl Server {
             auth: secret.map(Authenticator::new),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            http_socket: None,
         }
     }
 
@@ -53,6 +60,11 @@ impl Server {
     /// Set the IP address where the control server will bind to.
     pub fn set_bind_tunnels(&mut self, bind_tunnels: IpAddr) {
         self.bind_tunnels = bind_tunnels;
+    }
+
+    /// Sets the UNIX socket which is opened for HTTP connections.
+    pub fn set_http_socket(&mut self, http_socket: Option<PathBuf>) {
+        self.http_socket = http_socket;
     }
 
     /// Start the server, listening for new connections.
@@ -78,7 +90,7 @@ impl Server {
         }
     }
 
-    async fn create_listener(&self, port: u16) -> Result<TcpListener, &'static str> {
+    async fn create_tcp_listener(&self, port: u16) -> Result<TcpListener, &'static str> {
         let try_bind = |port: u16| async move {
             TcpListener::bind((self.bind_tunnels, port))
                 .await
@@ -115,6 +127,23 @@ impl Server {
         }
     }
 
+    async fn create_http_listener(&self) -> Result<UnixListener, &'static str> {
+        let Some(socket) = &self.http_socket else {
+            return Err("server doesn't support HTTP forwarding");
+        };
+
+        match UnixListener::bind(socket) {
+            Ok(l) => Ok(l),
+            Err(err)
+                if [io::ErrorKind::AddrInUse, io::ErrorKind::AlreadyExists]
+                    .contains(&err.kind()) =>
+            {
+                Err("an HTTP forwarding session is already in progress")
+            }
+            Err(_) => Err("failed to bind to HTTP socket"),
+        }
+    }
+
     async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
         let mut stream = Delimited::new(stream);
         if let Some(auth) = &self.auth {
@@ -130,8 +159,8 @@ impl Server {
                 warn!("unexpected authenticate");
                 Ok(())
             }
-            Some(ClientMessage::Hello(port)) => {
-                let listener = match self.create_listener(port).await {
+            Some(ClientMessage::Hello(ForwardingEndpoint::Tcp(port))) => {
+                let listener = match self.create_tcp_listener(port).await {
                     Ok(listener) => listener,
                     Err(err) => {
                         stream.send(ServerMessage::Error(err.into())).await?;
@@ -140,33 +169,21 @@ impl Server {
                 };
                 let host = listener.local_addr()?.ip();
                 let port = listener.local_addr()?.port();
-                info!(?host, ?port, "new client");
-                stream.send(ServerMessage::Hello(port)).await?;
-
-                loop {
-                    if stream.send(ServerMessage::Heartbeat).await.is_err() {
-                        // Assume that the TCP connection has been dropped.
+                info!(?host, ?port, "opened TCP listener");
+                self.handle_forwarding_client(stream, ForwardingEndpoint::Tcp(port), listener).await
+            }
+            Some(ClientMessage::Hello(ForwardingEndpoint::Http)) => {
+                let listener = match self.create_http_listener().await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        stream.send(ServerMessage::Error(err.into())).await?;
                         return Ok(());
                     }
-                    const TIMEOUT: Duration = Duration::from_millis(500);
-                    if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
-                        let (stream2, addr) = result?;
-                        info!(?addr, ?port, "new connection");
-
-                        let id = Uuid::new_v4();
-                        let conns = Arc::clone(&self.conns);
-
-                        conns.insert(id, stream2);
-                        tokio::spawn(async move {
-                            // Remove stale entries to avoid memory leaks.
-                            sleep(Duration::from_secs(10)).await;
-                            if conns.remove(&id).is_some() {
-                                warn!(%id, "removed stale connection");
-                            }
-                        });
-                        stream.send(ServerMessage::Connection(id)).await?;
-                    }
-                }
+                };
+                info!("opened HTTP listener");
+                self.handle_forwarding_client(stream, ForwardingEndpoint::Http, listener).await?;
+                _ = std::fs::remove_file(self.http_socket.as_ref().unwrap());
+                Ok(())
             }
             Some(ClientMessage::Accept(id)) => {
                 info!(%id, "forwarding connection");
@@ -184,4 +201,65 @@ impl Server {
             None => Ok(()),
         }
     }
+
+    async fn handle_forwarding_client(
+        &self,
+        mut stream: Delimited<TcpStream>,
+        endpoint: ForwardingEndpoint,
+        listener: impl Listener,
+    ) -> Result<()> {
+        stream.send(ServerMessage::Hello(endpoint)).await?;
+
+        loop {
+            if stream.send(ServerMessage::Heartbeat).await.is_err() {
+                // Assume that the TCP connection has been dropped.
+                return Ok(());
+            }
+            const TIMEOUT: Duration = Duration::from_millis(500);
+            if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
+                let (stream2, addr) = result?;
+                info!(?addr, ?endpoint, "new connection");
+
+                let id = Uuid::new_v4();
+                let conns = Arc::clone(&self.conns);
+
+                conns.insert(id, Box::pin(stream2));
+                tokio::spawn(async move {
+                    // Remove stale entries to avoid memory leaks.
+                    sleep(Duration::from_secs(10)).await;
+                    if conns.remove(&id).is_some() {
+                        warn!(%id, "removed stale connection");
+                    }
+                });
+                stream.send(ServerMessage::Connection(id)).await?;
+            }
+        }
+    }
 }
+
+trait Listener {
+    type Connection: Connection;
+    type Address: Debug;
+    async fn accept(&self) -> Result<(Self::Connection, Self::Address)>;
+}
+trait Connection: AsyncRead + AsyncWrite + Send + Sync + 'static {}
+
+impl Listener for TcpListener {
+    type Connection = TcpStream;
+    type Address = SocketAddr;
+
+    async fn accept(&self) -> Result<(Self::Connection, Self::Address)> {
+        self.accept().await.map_err(Error::from)
+    }
+}
+impl Connection for TcpStream {}
+
+impl Listener for UnixListener {
+    type Connection = UnixStream;
+    type Address = tokio::net::unix::SocketAddr;
+
+    async fn accept(&self) -> Result<(Self::Connection, Self::Address)> {
+        self.accept().await.map_err(Error::from)
+    }
+}
+impl Connection for UnixStream {}

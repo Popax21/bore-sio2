@@ -8,7 +8,9 @@ use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::auth::Authenticator;
-use crate::shared::{ClientMessage, Delimited, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT};
+use crate::shared::{
+    ClientMessage, Delimited, ForwardingEndpoint, ServerMessage, CONTROL_PORT, NETWORK_TIMEOUT,
+};
 
 /// State structure for the client.
 pub struct Client {
@@ -24,8 +26,8 @@ pub struct Client {
     /// Local port that is forwarded.
     local_port: u16,
 
-    /// Port that is publicly available on the remote.
-    remote_port: u16,
+    /// Endpoint that is publicly available on the remote.
+    remote_endpoint: ForwardingEndpoint,
 
     /// Optional secret used to authenticate clients.
     auth: Option<Authenticator>,
@@ -37,7 +39,7 @@ impl Client {
         local_host: &str,
         local_port: u16,
         to: &str,
-        port: u16,
+        endpoint: ForwardingEndpoint,
         secret: Option<&str>,
     ) -> Result<Self> {
         let mut stream = Delimited::new(connect_with_timeout(to, CONTROL_PORT).await?);
@@ -46,9 +48,9 @@ impl Client {
             auth.client_handshake(&mut stream).await?;
         }
 
-        stream.send(ClientMessage::Hello(port)).await?;
-        let remote_port = match stream.recv_timeout().await? {
-            Some(ServerMessage::Hello(remote_port)) => remote_port,
+        stream.send(ClientMessage::Hello(endpoint)).await?;
+        let remote_endpoint = match stream.recv_timeout().await? {
+            Some(ServerMessage::Hello(remote_endpoint)) => remote_endpoint,
             Some(ServerMessage::Error(message)) => bail!("server error: {message}"),
             Some(ServerMessage::Challenge(_)) => {
                 bail!("server requires authentication, but no client secret was provided");
@@ -56,22 +58,26 @@ impl Client {
             Some(_) => bail!("unexpected initial non-hello message"),
             None => bail!("unexpected EOF"),
         };
-        info!(remote_port, "connected to server");
-        info!("listening at {to}:{remote_port}");
+        info!(?remote_endpoint, "connected to server");
+
+        match remote_endpoint {
+            ForwardingEndpoint::Tcp(port) => info!("listening at {to}:{port}"),
+            ForwardingEndpoint::Http => info!("listening at http[s]://{to}"),
+        }
 
         Ok(Client {
             conn: Some(stream),
             to: to.to_string(),
             local_host: local_host.to_string(),
             local_port,
-            remote_port,
+            remote_endpoint,
             auth,
         })
     }
 
-    /// Returns the port publicly available on the remote.
-    pub fn remote_port(&self) -> u16 {
-        self.remote_port
+    /// Returns the endpoint publicly available on the remote.
+    pub fn remote_endpoint(&self) -> ForwardingEndpoint {
+        self.remote_endpoint
     }
 
     /// Start the client, listening for new connections.
